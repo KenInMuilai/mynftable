@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-## nftables 端口转发管理工具 v1.2 (Alpine 适配版)
+## nftables 端口转发管理工具 v1.3 (NAT ＆ Alpine 完美适配版)
 ## 交互式管理 DNAT 端口转发规则
 
 # ============== 常量定义 ==============
@@ -9,7 +9,6 @@ BACKUP_DIR="${CONF_DIR}/backups"
 MAIN_CONF="/etc/nftables.conf"
 SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
 LOG_FILE="/var/log/nft-forward.log"
-LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
 TABLE_NAME="port_forward"
 
 # ============== 日志函数 ==============
@@ -61,22 +60,6 @@ validate_ip() {
     return 0
 }
 
-# ============== 自动获取本机 IP ==============
-get_local_ip() {
-    local ip
-    # 适配 Alpine/BusyBox 的 awk 提取法
-    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
-    if [[ -n "$ip" ]]; then
-        echo "$ip"
-        return
-    fi
-    ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
-    if [[ -n "$ip" ]]; then
-        echo "$ip"
-        return
-    fi
-}
-
 # ============== 发行版检测 ==============
 detect_pkg_manager() {
     if command -v apk &>/dev/null; then
@@ -90,83 +73,6 @@ detect_pkg_manager() {
     else
         echo "unknown"
     fi
-}
-
-has_iptables() {
-    command -v iptables &>/dev/null && iptables -S &>/dev/null
-}
-
-try_persist_iptables() {
-    if command -v iptables-save &>/dev/null; then
-        if [[ -d /etc/iptables ]]; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null && return 0
-        fi
-    fi
-    return 1
-}
-
-dest_still_used() {
-    local check_ip="$1" check_dport="$2" exclude_lport="$3"
-    local rule lport dip dport note
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport note <<< "$rule"
-        [[ "$lport" == "$exclude_lport" ]] && continue
-        if [[ "$dip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-# ============== 端口放行 ==============
-firewall_open_port() {
-    local lport="$1" dest_ip="$2" dport="$3"
-
-    if has_iptables; then
-        iptables -C INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
-        iptables -C INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        info "已在 iptables 中开通对应放行规则。"
-        try_persist_iptables || true
-    fi
-}
-
-firewall_close_port() {
-    local lport="$1" dest_ip="$2" dport="$3" force="${4:-}"
-
-    if has_iptables; then
-        iptables -D INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
-        if [[ "$force" == "force" ]] || ! dest_still_used "$dest_ip" "$dport" "$lport"; then
-            iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
-        fi
-        try_persist_iptables || true
-    fi
-}
-
-check_port_conflict() {
-    local port="$1"
-    local conflict=""
-    if command -v ss &>/dev/null; then
-        if ss -tlnp 2>/dev/null | grep -qE ":${port}\b"; then conflict="TCP"; fi
-        if ss -ulnp 2>/dev/null | grep -qE ":${port}\b"; then
-            conflict=$([[ -n "$conflict" ]] && echo "TCP+UDP" || echo "UDP")
-        fi
-    fi
-    if [[ -n "$conflict" ]]; then
-        warn "本机端口 ${port} 已被其他服务占用（${conflict}）。"
-        read -rp "是否仍要继续添加转发规则？[y/N]: " ans
-        if [[ ! "$ans" =~ ^[Yy]$ ]]; then return 1; fi
-    fi
-    return 0
 }
 
 # ============== 初始化配置 ==============
@@ -198,16 +104,6 @@ sanitize_note() {
     printf "%s" "$note"
 }
 
-get_conf_local_ip() {
-    [[ -f "${CONF_FILE}" ]] || return
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*define[[:space:]]+LOCAL_IP[[:space:]]*=[[:space:]]*([0-9.]+) ]]; then
-            printf "%s" "${BASH_REMATCH[1]}"
-            return
-        fi
-    done < "${CONF_FILE}"
-}
-
 load_rules() {
     RULES=()
     [[ -f "${CONF_FILE}" ]] || return
@@ -225,20 +121,15 @@ load_rules() {
     done < "${CONF_FILE}"
 }
 
+# ============== 核心：基于 ｍasquerade 写入配置文件 ==============
 write_conf_file() {
-    local local_ip
-    local_ip=$(get_local_ip)
-    [[ -z "$local_ip" ]] && local_ip=$(get_conf_local_ip)
-    if [[ -z "$local_ip" ]]; then
-        err "无法获取本机 IP 地址，请检查网络配置。"
-        return 1
-    fi
-
     local tmp_file="${CONF_FILE}.tmp.$$"
+    
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
-define LOCAL_IP = ${local_ip}
+
 table ip ${TABLE_NAME} {
+    # --- PREROUTING (仅截获指定端口流量进行中转) ---
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
 EOF
@@ -253,14 +144,16 @@ EOF
 
     cat >> "${tmp_file}" <<EOF
     }
+
+    # --- POSTROUTING (回源伪装：采用 masquerade 智能识别，安全、绝不干扰原有节点服务) ---
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
 EOF
 
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport note <<< "$rule"
-        echo "        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP" >> "${tmp_file}"
-        echo "        ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP" >> "${tmp_file}"
+        echo "        ip daddr ${dip} tcp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
+        echo "        ip daddr ${dip} udp dport ${dport} ct status dnat masquerade" >> "${tmp_file}"
     done
 
     echo -e "    }\n}" >> "${tmp_file}"
@@ -289,26 +182,29 @@ enable_ip_forward() {
 }
 
 enable_bbr_fq() {
-    # 针对 Alpine 优化 BBR 检测与开启
     modprobe tcp_bbr 2>/dev/null || true
+    # 检查内核是否真的支持 bbr
     if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        warn "当前内核未加载 BBR 模块，跳过配置。"
+        warn "当前系统内核未编译或不支持 BBR 模块，自动跳过网络劣化优化。"
         return 0
     fi
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-    echo -e "net.core.default_qdisc=fq\net.ipv4.tcp_congestion_control=bbr" > "${SYSCTL_CONF}" 2>/dev/null || true
+    # 尝试应用，若不支持 fq 队列（比如某些 OpenVZ/LXC 容器）则进行安全兜底
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+    
+    local qdisc
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "pfifo_fast")
+    echo -e "net.core.default_qdisc=${qdisc}\net.ipv4.tcp_congestion_control=bbr" > "${SYSCTL_CONF}" 2>/dev/null || true
     sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    info "BBR + fq 优化参数已应用。"
+    info "网络拥塞控制参数已根据您的 NAT 容器架构进行了安全适配。"
 }
 
-# ============== 诊断/自检 (适配 OpenRC) ==============
+# ============== 诊断/自检 ==============
 do_diagnose() {
-    echo -e "\n========================================\n           诊断 / 自检 (Alpine)\n========================================"
+    echo -e "\n========================================\n           诊断 / 自检 (Alpine-NAT)\n========================================"
     [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && info "IPv4 转发: 已开启" || err "IPv4 转发: 未开启"
     command -v nft &>/dev/null && info "nftables: 已安装" || err "nftables: 未安装"
 
-    # OpenRC 状态检测
     if rc-service nftables status 2>/dev/null | grep -q "started"; then
         info "nftables 服务状态: 运行中"
     else
@@ -325,21 +221,20 @@ do_diagnose() {
     echo ""
 }
 
-# ============== 安装 nftables ==============
+# ============== 安装 nftables ＆ 环境 ==============
 do_install() {
     echo ""
     local pkg_mgr
     pkg_mgr=$(detect_pkg_manager)
 
     if [[ "$pkg_mgr" == "apk" ]]; then
-        info "检测到 Alpine 系统，正在通过 apk 补全环境 (bash, grep, iproute2, nftables)..."
-        apk update && apk add bash grep iproute2 nftables iptables
+        info "正在为 Alpine 补全运行环境环境依赖 (bash, grep, iproute2, nftables)..."
+        apk update && apk add bash grep iproute2 nftables
     else
-        # 兜底其他系统
         case "$pkg_mgr" in
             apt) apt-get update -y && apt-get install -y nftables ;;
             dnf|yum) ${pkg_mgr} install -y nftables ;;
-            *) err "未知发行版，请手动安装依赖。"; return ;;
+            *) err "未知发行版，请手动安装 nftables。"; return ;;
         esac
     fi
 
@@ -352,17 +247,16 @@ do_install() {
     enable_bbr_fq
     init_conf
 
-    # Alpine OpenRC 服务激活与开机自启
     if command -v rc-update &>/dev/null; then
         rc-update add nftables default >/dev/null 2>&1
         rc-service nftables start >/dev/null 2>&1
-        info "已激活 OpenRC nftables 服务并设置开机自启。"
+        info "已激活并拉起 OpenRC nftables 核心系统服务。"
     fi
 
-    info "安装与初始化完成。"
+    info "基础安装与安全适配初始化完成。"
 }
 
-# ============== 其余菜单交互逻辑 ==============
+# ============== 菜单交互逻辑 ==============
 edit_rule_note() {
     local ans
     read -rp "是否添加/修改备注？[y/N]: " ans
@@ -407,27 +301,25 @@ do_add() {
 
     local lport dip dport note
     while true; do
-        read -rp "请输入本机监听端口 (1-65535): " lport
-        validate_port "$lport" && break || err "端口无效。"
+        read -rp "请输入本机映射进来的“外部监听端口” (1-65535): " lport
+        validate_port "$lport" && break || err "端口格式错误。"
     done
 
     local rule rp
     for rule in "${RULES[@]}"; do
         IFS='|' read -r rp _ _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then err "该端口已存在转发规则。"; return; fi
+        if [[ "$rp" == "$lport" ]]; then err "该监听端口转发规则已存在！"; return; fi
     done
 
-    check_port_conflict "$lport" || return
-
     while true; do
-        read -rp "请输入目标 IP 地址: " dip
+        read -rp "请输入要转发到的“目标 IP 地址”: " dip
         validate_ip "$dip" && break || err "IP 格式错误。"
     done
 
     while true; do
-        read -rp "请输入目标端口 [默认: ${lport}]: " dport
+        read -rp "请输入“目标端口” [默认: ${lport}]: " dport
         dport="${dport:-$lport}"
-        validate_port "$dport" && break || err "端口无效。"
+        validate_port "$dport" && break || err "端口格式错误。"
     done
 
     read -rp "请输入备注（可留空）: " note
@@ -436,10 +328,9 @@ do_add() {
     backup_conf
     RULES+=("${lport}|${dip}|${dport}|${note}")
     if write_conf_file && reload_rules; then
-        firewall_open_port "$lport" "$dip" "$dport"
-        info "规则添加成功！"
+        info "NAT 端口转发规则成功无感知切入内核！"
     else
-        err "应用配置失败。"
+        err "应用配置失败，请检查诊断信息。"
     fi
 }
 
@@ -461,16 +352,12 @@ do_delete() {
         return
     fi
 
-    local target="${RULES[$((choice-1))]}"
-    IFS='|' read -r lport dip dport note <<< "$target"
-
     backup_conf
     unset 'RULES[$((choice-1))]'
     RULES=("${RULES[@]}")
 
     if write_conf_file && reload_rules; then
-        firewall_close_port "$lport" "$dip" "$dport"
-        info "规则删除成功。"
+        info "规则删除成功，无用内核规则已被无缝剔除。"
     fi
 }
 
@@ -482,21 +369,15 @@ do_clear_all() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return
 
     backup_conf
-    local rule lport dip dport note
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport note <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
-    done
-
     RULES=()
     if write_conf_file && reload_rules; then
-        info "已清空所有转发规则。"
+        info "已清空所有中转规则，系统网络完全恢复白净。"
     fi
 }
 
 main_menu() {
     while true; do
-        echo -e "\n========================================\n   nftables 端口转发工具 v1.2 (Alpine)\n========================================"
+        echo -e "\n========================================\n   nftables 端口转发工具 v1.3 (Alpine)\n========================================"
         echo "  1) 安装/补全 Alpine 环境"
         echo "  2) 查看现有端口转发"
         echo "  3) 新增端口转发"
